@@ -1,19 +1,17 @@
-import os # Biblioteca para manipulação de arquivos e variáveis de ambiente
-import psycopg # Biblioteca para conexão com o banco de dados
-from ftplib import FTP # Biblioteca para conexão com FTP
-import logging # Biblioteca para logs
-from dotenv import load_dotenv # Biblioteca para carregar variáveis de ambiente
-import re # Biblioteca para expressões regulares
-from datetime import datetime # Biblioteca para manipulação de datas
+import os
+import psycopg2
+from ftplib import FTP
+import logging
+from dotenv import load_dotenv
+import re
+from datetime import datetime
+import tempfile
 
-# Carregar variáveis de ambiente
 load_dotenv()
 
-# Configuração de log
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def connect_db():
-    """Conecta ao banco de dados usando variáveis de ambiente."""
     try:
         conn = psycopg2.connect(
             host=os.getenv("DB_HOST"),
@@ -29,19 +27,47 @@ def connect_db():
         return None
 
 def sanitize_filename(filename):
-    """Limpa o nome do arquivo, removendo caracteres inválidos."""
     return re.sub(r'[\\/*?:"<>|]', "", filename)
 
 def formatar_cpf(cpf):
-    """Formata o CPF no padrão 000.000.000-00."""
-    cpf = re.sub(r'\D', '', cpf)  # Remove todos os caracteres não numéricos
+    if not cpf or not cpf.strip():
+        return None
+    
+    cpf = re.sub(r'\D', '', cpf)
     if len(cpf) == 11:
         return f"{cpf[:3]}.{cpf[3:6]}.{cpf[6:9]}-{cpf[9:]}"
-    return cpf  # Retorna o CPF original se não tiver 11 dígitos
+    return None
+
+def get_download_directory():
+    download_dir = os.path.join(os.path.expanduser("~"), "Downloads", "ftp_hps")
+    
+    try:
+        os.makedirs(download_dir, exist_ok=True)
+        
+        if os.access(download_dir, os.W_OK):
+            logging.info(f"Diretório de download: {download_dir}")
+            return download_dir
+    except Exception as e:
+        logging.warning(f"Não foi possível usar Downloads: {e}")
+    
+    try:
+        download_dir = os.path.join(tempfile.gettempdir(), "ftp_hps")
+        os.makedirs(download_dir, exist_ok=True)
+        
+        if os.access(download_dir, os.W_OK):
+            logging.info(f"Usando diretório temporário: {download_dir}")
+            return download_dir
+    except Exception as e:
+        logging.warning(f"Não foi possível usar diretório temporário: {e}")
+    
+    download_dir = os.path.dirname(os.path.abspath(__file__))
+    logging.warning(f"Usando diretório do script: {download_dir}")
+    return download_dir
 
 def download_ftp_file():
-    """Baixa o arquivo mais recente do FTP."""
     ftp = None
+    local_filename = None
+    
     try:
         ftp = FTP()
         ftp.connect(os.getenv("FTP_HOST"), int(os.getenv("FTP_PORT", 21)), timeout=60)
@@ -53,173 +79,255 @@ def download_ftp_file():
             logging.warning("Nenhum arquivo encontrado no FTP.")
             return None
 
-        # Encontra o arquivo mais recente
-        latest_file = max(files, key=lambda x: datetime.strptime(ftp.sendcmd(f"MDTM {x}").split()[1], "%Y%m%d%H%M%S"))
-        local_filename = sanitize_filename(os.path.basename(latest_file))
+        try:
+            latest_file = max(files, key=lambda x: datetime.strptime(ftp.sendcmd(f"MDTM {x}").split()[1], "%Y%m%d%H%M%S"))
+            logging.info(f"Arquivo mais recente encontrado (via MDTM): {latest_file}")
+        except:
+            latest_file = files[-1]
+            logging.warning(f"MDTM não suportado, usando último arquivo da lista: {latest_file}")
+        
+        download_dir = get_download_directory()
+        local_filename = os.path.join(download_dir, sanitize_filename(os.path.basename(latest_file)))
+        
+        if os.path.exists(local_filename):
+            try:
+                os.remove(local_filename)
+                logging.info(f"Arquivo existente removido: {local_filename}")
+            except PermissionError:
+                logging.error(f"Sem permissão para remover arquivo existente: {local_filename}")
+                local_filename = os.path.join(download_dir, 
+                    f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{sanitize_filename(os.path.basename(latest_file))}")
+                logging.info(f"Usando nome alternativo: {local_filename}")
 
+        logging.info(f"Iniciando download para: {local_filename}")
         with open(local_filename, 'wb') as local_file:
             ftp.retrbinary(f'RETR {latest_file}', local_file.write)
 
-        logging.info(f"Arquivo {latest_file} baixado com sucesso.")
+        logging.info(f"Arquivo {latest_file} baixado com sucesso para {local_filename}")
         return local_filename
 
     except Exception as e:
         logging.error(f"Erro ao baixar arquivo do FTP: {e}")
+        
+        if local_filename and os.path.exists(local_filename):
+            try:
+                os.remove(local_filename)
+                logging.info(f"Arquivo parcial removido: {local_filename}")
+            except:
+                pass
+                
         return None
     finally:
         if ftp:
-            ftp.quit()
+            try:
+                ftp.quit()
+            except:
+                pass
+
+def find_motorista(cursor, mot_nom, mot_cpf):
+    if mot_cpf:
+        cursor.execute("SELECT mot_id, mot_nom FROM motorista WHERE mot_cpf = %s", (mot_cpf,))
+        result = cursor.fetchone()
+        if result:
+            logging.info(f" Motorista encontrado por CPF: ID {result[0]}, Nome: {result[1]}")
+            return result[0]
+    
+    mot_nom_clean = mot_nom.strip().upper()
+    
+    cursor.execute("SELECT mot_id, mot_nom FROM motorista WHERE UPPER(mot_nom) = %s", (mot_nom_clean,))
+    result = cursor.fetchone()
+    if result:
+        logging.info(f" Motorista encontrado por nome exato: ID {result[0]}, Nome: {result[1]}")
+        return result[0]
+    
+    cursor.execute("""
+        SELECT mot_id, mot_nom 
+        FROM motorista 
+        WHERE UPPER(mot_nom) LIKE %s OR UPPER(mot_nom) LIKE %s
+    """, (f"{mot_nom_clean}%", f"%{mot_nom_clean}%"))
+    
+    results = cursor.fetchall()
+    if len(results) == 1:
+        logging.info(f" Motorista encontrado por similaridade: ID {results[0][0]}, Nome: {results[0][1]}")
+        return results[0][0]
+    elif len(results) > 1:
+        logging.warning(f" Múltiplos motoristas encontrados para nome similar '{mot_nom}': {[r[1] for r in results]}")
+    
+    return None
 
 def process_and_insert_data(file_name, conn):
+    if not file_name or not os.path.exists(file_name):
+        logging.error(f"Arquivo não encontrado: {file_name}")
+        return
+
     logging.info(f"Iniciando processamento do arquivo: {file_name}")
+    
+    encodings = ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1']
+    file_content = None
+    used_encoding = None
+    
+    for enc in encodings:
+        try:
+            with open(file_name, 'r', encoding=enc) as file:
+                file_content = file.readlines()
+            used_encoding = enc
+            logging.info(f" Arquivo lido com encoding: {enc}")
+            break
+        except UnicodeDecodeError:
+            logging.debug(f"Falha ao ler com encoding {enc}, tentando próximo...")
+            continue
+    
+    if not file_content:
+        logging.error(f"✗ Não foi possível ler o arquivo com nenhum encoding suportado")
+        return
+    
     try:
-        with open(file_name, 'r') as file:
-            for line_number, line in enumerate(file, start=1):
-                data = line.strip().split(';')
-                
-                if len(data) < 16:  # Ajuste para 16 colunas
-                    logging.warning(f"Erro no layout da linha {line_number}: esperado 16 colunas, recebeu {len(data)} - {line}")
-                    continue
+        for line_number, line in enumerate(file_content, start=1):
+            data = line.strip().split(';')
+            
+            if len(data) < 17:
+                logging.warning(f"Erro no layout da linha {line_number}: esperado 17 colunas, recebeu {len(data)}")
+                continue
 
+            try:
+                vei_id = int(data[0])
+                mot_id = int(data[6]) if data[6].isdigit() else None
+            except ValueError:
+                logging.warning(f"ID_FROTA_HPS ou CODIGO_RDC_MOTORISTA inválido na linha {line_number}: {data[0]}, {data[6]}") 
+                continue
+
+            vei_plc = data[1].strip()
+            mot_nom = data[4].strip() if data[4] and data[4].strip() != "EM DEFINICAO" else "EM DEFINICAO"
+            placa_car = data[5].strip()
+            mot_tel = data[7].strip() if data[7] and data[7].strip() else None
+            mot_cnh = data[9].strip() if data[9] and data[9].strip() else None
+            mot_cpf = formatar_cpf(data[10]) if data[10] else None
+            mot_rua = data[12].strip() if data[12] else None
+            mot_num = data[13].strip() if data[13] else None
+            mot_bai = data[14].strip() if len(data) > 14 and data[14] else None
+            mot_cid = data[15][:25].strip() if len(data) > 15 and data[15] else None
+            mot_uf = data[16].strip() if len(data) > 16 and data[16] else None
+
+            if vei_id == 51773:
+                logging.warning(f"[MONITOR] Veículo 51773 encontrado. Placa recebida do TXT: {vei_plc}")
+
+            if mot_id == 999999:
+                mot_id = None
+
+            cli_id = 269
+
+            logging.info(f"Processando: Motorista '{mot_nom}', CPF: {mot_cpf}, Veículo: {vei_id}")
+
+            with conn.cursor() as cursor:
                 try:
-                    vei_id = int(data[0])  # ID_FROTA_HPS
-                    mot_id = int(data[6]) if data[6].isdigit() else None  # CODIGO_RDC_MOTORISTA
-                except ValueError:
-                    logging.warning(f"ID_FROTA_HPS ou CODIGO_RDC_MOTORISTA inválido na linha {line_number}: {data[0]}, {data[6]}") 
-                    continue
+                    cursor.execute("BEGIN;")
 
-                vei_plc = data[1]  # PLACA_FROTA
-                mot_nom = data[4].strip() if data[4] and data[4].strip() != "EM DEFINICAO" else "EM DEFINICAO"  # NOME_MOTORISTA
-                placa_car = data[5]  # PLACA_DESCRIÇÃO_CARRETA
-                mot_tel = data[7] if data[7] else None  # TELEFONE_MOTORISTA
-                mot_cnh = data[9] if data[9] else None  # CNH_MOTORISTA
-                mot_cpf = formatar_cpf(data[10]) if data[10] else None  # CPF_MOTORISTA - CPF formatado
-                mot_rua = data[12]  # MOT_RUA (endereço)
-                mot_num = data[13]  # NUMERO_MOTORISTA
-                mot_bai = data[14] if len(data) > 14 else None  # BAIRRO_MOTORISTA
-                mot_cid = data[15][:25]  # MUNICIPIO_MOTORISTA
-                mot_uf = data[16]  # UF_MOTORISTA
-
-                if mot_id == 999999:  # Corrigido: verificando o ID de motorista
-                    mot_id = None
-
-                # Adiciona cli_id 269 para todos os motoristas
-                cli_id = 269
-
-                # Log dos dados a serem inseridos/atualizados
-                logging.info(f"Processando dados para o motorista ID: {mot_id if mot_id else 'Novo'}")
-                logging.debug(f"Dados a serem inseridos/atualizados: ")
-                logging.debug(f"vei_id: {vei_id}, vei_plc: {vei_plc}, mot_nom: {mot_nom}, mot_tel: {mot_tel}, mot_cnh: {mot_cnh}, mot_cpf: {mot_cpf}")
-                logging.debug(f"mot_rua: {mot_rua}, mot_num: {mot_num}, mot_bai: {mot_bai}, mot_cid: {mot_cid}, mot_uf: {mot_uf}")
-                logging.debug(f"placa_car: {placa_car}")
-
-                # Inserção ou atualização dos dados no banco
-                with conn.cursor() as cursor:
-                    try:
-                        # Inicia a transação para esse motorista
-                        cursor.execute("BEGIN;")
-
-                        # Verifica se o motorista existe com base no mot_nom ou mot_cpf (um ou outro)
-                        search_query = "SELECT mot_id FROM motorista WHERE mot_nom = %s OR mot_cpf = %s"
-                        cursor.execute(search_query, (mot_nom, mot_cpf))
-                        result = cursor.fetchone()
-
-                        if result:  # Se o motorista já existir, usa o mot_id para atualizar
-                            mot_id = result[0]
-
-                            # Atualiza todos os dados do motorista
-                            cursor.execute(
-                                """
-                                UPDATE motorista
-                                SET cli_id = %s, mot_nom = %s, mot_tel = %s, mot_cnh = %s, mot_cpf = %s, mot_rua = %s, 
-                                    mot_num = %s, mot_bai = %s, mot_cid = %s, mot_uf = %s
-                                WHERE mot_id = %s
-                                """,
-                                (cli_id, mot_nom, mot_tel, mot_cnh, mot_cpf, mot_rua, mot_num, mot_bai, mot_cid, mot_uf, mot_id)
-                            )
-                            logging.info(f"Dados do motorista atualizado para o ID {mot_id}")
-                        else:  # Se o motorista não existir, insere como novo
-                            cursor.execute(
-                                """
-                                INSERT INTO motorista (cli_id, mot_nom, mot_tel, mot_cnh, mot_cpf, mot_rua, mot_num, mot_bai, mot_cid, mot_uf, mot_mat)
-                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                                RETURNING mot_id
-                                """,
-                                (cli_id, mot_nom, mot_tel, mot_cnh, mot_cpf, mot_rua, mot_num, mot_bai, mot_cid, mot_uf, None)  # mot_mat será None
-                            )
-                            mot_id = cursor.fetchone()[0]  # Obtém o ID gerado do novo motorista
-                            logging.info(f"Motorista inserido com sucesso! ID gerado: {mot_id}")
-
-                        # Atualiza a tabela grid_ext (forçando a atualização do placa_car com a descrição da carreta)
-                        logging.debug(f"Atualizando a tabela grid_ext para o veículo ID: {vei_id} e placa_car (descrição carreta): {placa_car}")
+                    existing_mot_id = find_motorista(cursor, mot_nom, mot_cpf)
+                    
+                    if existing_mot_id:
+                        mot_id = existing_mot_id
                         cursor.execute(
                             """
-                            UPDATE grid_ext
-                            SET placa_car = %s, mot_nom = %s, mot_id = %s
-                            WHERE vei_id = %s
+                            UPDATE motorista
+                            SET cli_id = %s, mot_nom = %s, mot_tel = %s, mot_cnh = %s, mot_cpf = %s, 
+                                mot_rua = %s, mot_num = %s, mot_bai = %s, mot_cid = %s, mot_uf = %s
+                            WHERE mot_id = %s
                             """,
-                            (placa_car, mot_nom, mot_id, vei_id)
+                            (cli_id, mot_nom, mot_tel, mot_cnh, mot_cpf, mot_rua, mot_num, mot_bai, mot_cid, mot_uf, mot_id)
                         )
-                        if cursor.rowcount == 0:
-                            logging.warning(f"Nenhuma atualização realizada na tabela grid_ext para a placa {placa_car}")
-                        else:
-                            logging.info(f"Alteração realizada na tabela grid_ext para a placa {placa_car}")
-
-                        # Atualiza a tabela cad_veiculo
+                        logging.info(f" Motorista atualizado: ID {mot_id}, Nome: {mot_nom}")
+                    else:
                         cursor.execute(
                             """
-                            UPDATE cad_veiculo
-                            SET vei_plc = %s
-                            WHERE vei_id = %s
+                            INSERT INTO motorista (cli_id, mot_nom, mot_tel, mot_cnh, mot_cpf, mot_rua, mot_num, mot_bai, mot_cid, mot_uf, mot_mat)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            RETURNING mot_id
                             """,
-                            (vei_plc, vei_id)
+                            (cli_id, mot_nom, mot_tel, mot_cnh, mot_cpf, mot_rua, mot_num, mot_bai, mot_cid, mot_uf, None)
                         )
-                        logging.info(f"Alteração realizada na tabela cad_veiculo para o veículo ID {vei_id}")
+                        mot_id = cursor.fetchone()[0]
+                        logging.info(f" NOVO motorista cadastrado: ID {mot_id}, Nome: {mot_nom}")
 
-                        # Atualiza a tabela last_datastore
-                        cursor.execute(
-                            """
-                            UPDATE last_datastore
-                            SET vei_id = %s
-                            WHERE vei_id = %s
-                            """,
-                            (vei_id, vei_id)
-                        )
-                        logging.info(f"Alteração realizada na tabela last_datastore para o veículo ID {vei_id}")
+                    cursor.execute(
+                        """
+                        UPDATE grid_ext
+                        SET placa_car = %s, mot_nom = %s, mot_id = %s
+                        WHERE vei_id = %s
+                        """,
+                        (placa_car, mot_nom, mot_id, vei_id)
+                    )
+                    if cursor.rowcount == 0:
+                        logging.warning(f" Nenhuma atualização na grid_ext para veículo {vei_id}")
+                    else:
+                        logging.info(f" Grid_ext atualizado para veículo {vei_id}")
 
-                        # Commit da transação
-                        cursor.execute("COMMIT;")
+                    cursor.execute(
+                        """
+                        UPDATE cad_veiculo
+                        SET vei_plc = %s
+                        WHERE vei_id = %s
+                        """,
+                        (vei_plc, vei_id)
+                    )
+                    logging.info(f" Cad_veiculo atualizado: Veículo {vei_id}, Placa: {vei_plc}")
 
-                    except Exception as e:
-                        cursor.execute("ROLLBACK;")
-                        logging.error(f"Erro ao atualizar os dados do motorista com ID {mot_id}. Dados tentados: Motivação: {e}")
-                logging.info(f"Processamento da linha {line_number} finalizado.")
+                    cursor.execute(
+                        """
+                        UPDATE last_datastore
+                        SET vei_id = %s
+                        WHERE vei_id = %s
+                        """,
+                        (vei_id, vei_id)
+                    )
+                    logging.info(f" Last_datastore atualizado para veículo {vei_id}")
+
+                    cursor.execute("COMMIT;")
+                    logging.info(f" Transação commitada para linha {line_number}")
+
+                except Exception as e:
+                    cursor.execute("ROLLBACK;")
+                    logging.error(f"✗ Erro na transação linha {line_number}: {e}")
+
+            logging.debug(f" Linha {line_number} processada.")
 
     except Exception as e:
         logging.error(f"Erro ao processar o arquivo {file_name}: {e}")
 
 def main():
-    # Conectar ao banco de dados
+    logging.info("=" * 80)
+    logging.info("Iniciando processo de integração FTP -> Banco de Dados")
+    logging.info("=" * 80)
+    
     conn = connect_db()
-    if conn:
-        # Baixar arquivo do FTP
-        file_name = download_ftp_file()
-        if file_name:
-            # Processar e inserir os dados no banco de dados
-            process_and_insert_data(file_name, conn)
+    if not conn:
+        logging.error("Não foi possível conectar ao banco de dados. Abortando.")
+        input("Pressione ENTER para fechar...")
+        return
 
-        # Fechar a conexão com o banco de dados
-        if conn is not None:
-            conn.close()
-            logging.info("Conexão com o banco de dados fechada.")
+    file_name = download_ftp_file()
+    if not file_name:
+        logging.error("Não foi possível baixar o arquivo do FTP. Abortando.")
+        conn.close()
+        input("Pressione ENTER para fechar...")
+        return
 
-        # Remover o arquivo processado
-        if file_name and os.path.exists(file_name):
+    process_and_insert_data(file_name, conn)
+
+    conn.close()
+    logging.info("Conexão com o banco de dados fechada.")
+
+    try:
+        if os.path.exists(file_name):
             os.remove(file_name)
             logging.info(f"Arquivo {file_name} removido após processamento.")
-        
-        # Pausar para interação do usuário antes de fechar
-        #input("Pressione qualquer tecla para fechar...")
+    except Exception as e:
+        logging.warning(f"Não foi possível remover o arquivo {file_name}: {e}")
+    
+    logging.info("=" * 80)
+    logging.info("Processo concluído com sucesso!")
+    logging.info("=" * 80)
+    
+    input("Pressione ENTER para fechar...")
 
 if __name__ == "__main__":
     main()
